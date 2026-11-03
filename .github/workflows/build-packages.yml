@@ -11,6 +11,10 @@ on:
   push:
     branches:
       - master
+    paths:
+      - 'honk/**'
+      - 'luci-app-honk/**'
+      - '.github/workflows/build-packages.yml'
 
 permissions:
   contents: write
@@ -30,7 +34,7 @@ jobs:
       sdks: ${{ steps.matrix.outputs.sdks }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Generate version metadata
         id: meta
@@ -97,20 +101,33 @@ jobs:
       matrix:
         arch:
           - aarch64_generic
-          - aarch64_cortex-a53
-          - aarch64_cortex-a72
-          - aarch64_cortex-a76
           - x86_64
         sdk: ${{ fromJson(needs.prepare.outputs.sdks) }}
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Remove vmlinux-btf dependency for CI
+      - name: Install host build tools
         shell: bash
         run: |
-          sed -i '/depends on KERNEL_DEBUG_INFO_BTF/d' honk/Makefile
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm libbpf-dev cmake libclang-dev zstd
+          curl -sSfL https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst | sudo tar --zstd -xf - -C /usr/local/bin
+          bpf-linker --version
+
+      - name: Setup Zig for BoringSSL musl cross-compilation
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Build honk-core binary
+        shell: bash
+        run: |
+          ./scripts/build_honk_core.sh "${{ matrix.arch }}" honk/files/honk-core.bin
 
       - name: Build packages
         uses: openwrt/gh-action-sdk@main
@@ -121,8 +138,6 @@ jobs:
           PACKAGES: honk luci-app-honk
           NO_REFRESH_CHECK: true
           NO_SHFMT_CHECK: true
-          UPSTREAM_URL: https://openwrt.fastly.net
-          FILE_HOST: https://openwrt.fastly.net
 
       - name: Show built files
         shell: bash
@@ -137,10 +152,15 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           shopt -s nullglob
-          for f in bin/packages/${{ matrix.arch }}/packages_ci/*.{ipk,apk}; do
+          for f in $(find bin/packages -type f \( -name "*.ipk" -o -name "*.apk" \)); do
             base="$(basename "$f")"
             ext="${base##*.}"
             name="${base%.*}"
+
+            # Filter for honk packages only
+            if [[ "$base" != *honk* ]]; then
+              continue
+            fi
 
             if [[ "$name" == *"${{ matrix.arch }}"* ]] || [[ "$name" == *"all"* ]] || [[ "$name" == luci-* ]]; then
               new_name="${name}-openwrt-${{ matrix.sdk }}.${ext}"
